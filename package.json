@@ -1,0 +1,15 @@
+{
+  "name": "tpg-contacts",
+  "version": "1.0.0",
+  "description": "Google Contacts API for TPG",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "googleapis": "^126.0.0",
+    "dotenv": "^16.3.1",
+    "cors": "^2.8.5"
+  }
+}
