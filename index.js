@@ -8,120 +8,140 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 8000;
-const { MONGODB_URI, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, INSTANCE_ID, API_TOKEN } = process.env;
+// שים לב: הוצאנו מפה את המשתנים של גרין API, כי עכשיו הכל דינמי לכל לקוח!
+const { MONGODB_URI, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI } = process.env;
 const GREEN_API_HOST = 'https://api.green-api.com';
 
 // --- חיבור למסד הנתונים ---
-mongoose.connect(MONGODB_URI || 'mongodb://localhost:27017/status_bot_db')
-    .then(() => console.log('✅ מסד נתונים מחובר בהצלחה'))
+mongoose.connect(MONGODB_URI || 'mongodb://localhost:27017/multi_tenant_bot')
+    .then(() => console.log('✅ מסד נתונים מרכזי מחובר'))
     .catch(err => console.log('❌ שגיאת חיבור למסד נתונים:', err));
 
-// סכמה לניהול מצב השיחה (כדי לדעת מתי אנחנו מחכים לשם)
+// סכמה ללקוחות שלך - שומרת את החשבון הספציפי של כל לקוח!
+const ClientAuthSchema = new mongoose.Schema({
+    instanceId: String,
+    apiToken: String,
+    googleTokens: Object
+});
+const ClientAuth = mongoose.model('ClientAuth', ClientAuthSchema);
+
+// סכמה למצב שיחות מול משתמשים בוואטסאפ
 const ChatStateSchema = new mongoose.Schema({
+    instanceId: String, // חשוב! מפריד בין לקוחות שונים
     chatId: String,
     state: { type: String, default: 'IDLE' }
 });
 const ChatState = mongoose.model('ChatState', ChatStateSchema);
 
-// סכמה לשמירת ההרשאה של גוגל
-const SystemSchema = new mongoose.Schema({ key: String, tokens: Object });
-const System = mongoose.model('System', SystemSchema);
-
-// --- הגדרת גוגל ---
-const oauth2Client = new google.auth.OAuth2(
-    GOOGLE_CLIENT_ID,
-    GOOGLE_CLIENT_SECRET,
-    GOOGLE_REDIRECT_URI
-);
-
-async function loadGoogleAuth() {
-    const authData = await System.findOne({ key: 'google_auth' });
-    if (authData && authData.tokens) {
-        oauth2Client.setCredentials(authData.tokens);
-    }
-}
-loadGoogleAuth();
-
-// --- פונקציה לשליחת הודעת וואטסאפ ---
-async function sendWAMessage(chatId, message) {
-    if (!INSTANCE_ID || !API_TOKEN) return;
-    const url = `${GREEN_API_HOST}/waInstance${INSTANCE_ID}/sendMessage/${API_TOKEN}`;
-    await axios.post(url, { chatId, message }).catch(e => console.log("❌ שגיאה בשליחת וואטסאפ:", e.message));
+// --- פונקציה לשליחת וואטסאפ ללקוח הספציפי ---
+async function sendWAMessage(instanceId, apiToken, chatId, message) {
+    const url = `${GREEN_API_HOST}/waInstance${instanceId}/sendMessage/${apiToken}`;
+    await axios.post(url, { chatId, message }).catch(e => console.log("❌ שגיאת וואטסאפ:", e.message));
 }
 
 // ==========================================
-// 1. הנגשה: אישור ראשוני מול גוגל
+// 1. הנגשה: הלינק החכם שאתה נותן ללקוחות שלך
 // ==========================================
 app.get('/auth/google', (req, res) => {
+    const { instance, token } = req.query;
+    if (!instance || !token) {
+        return res.send("<h2 style='color:red;text-align:center'>שגיאה: חסרים נתוני Green API בקישור (instance / token)</h2>");
+    }
+
+    const oauth2Client = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
+    
     const url = oauth2Client.generateAuthUrl({
         access_type: 'offline', 
         prompt: 'consent',
-        scope: ['https://www.googleapis.com/auth/contacts'] 
+        scope: ['https://www.googleapis.com/auth/contacts'],
+        // הטריק: אנחנו מעבירים לגוגל את נתוני הלקוח, כדי שיחזיר לנו אותם בסיום האישור!
+        state: `${instance}___${token}` 
     });
     res.redirect(url);
 });
 
+// החזרה מגוגל ושמירה של הלקוח הספציפי במסד הנתונים
 app.get('/auth/google/callback', async (req, res) => {
     try {
+        const oauth2Client = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
         const { tokens } = await oauth2Client.getToken(req.query.code);
-        oauth2Client.setCredentials(tokens);
-        await System.findOneAndUpdate({ key: 'google_auth' }, { tokens: tokens }, { upsert: true });
-        res.send(`<h1 style="color: green; text-align: center; margin-top: 50px;">✅ סנכרון אנשי הקשר בוצע בהצלחה! הבוט באוויר.</h1>`);
+        
+        // מחלצים את הנתונים של הלקוח הספציפי
+        const [instanceId, apiToken] = req.query.state.split('___');
+
+        // שומרים או מעדכנים את הלקוח במסד הנתונים המרכזי
+        await ClientAuth.findOneAndUpdate(
+            { instanceId: instanceId }, 
+            { apiToken: apiToken, googleTokens: tokens }, 
+            { upsert: true, new: true }
+        );
+
+        res.send(`<h1 style="color: green; text-align: center; margin-top: 50px;">✅ סנכרון בוצע בהצלחה! הבוט מחובר לחשבון הגוגל שלך.</h1>`);
     } catch (error) {
+        console.error(error);
         res.status(500).send('❌ שגיאה באימות מול גוגל');
     }
 });
 
 // ==========================================
-// 2. הבוט עצמו (Webhook מוואטסאפ)
+// 2. הבוט המרכזי (רץ עבור כל הלקוחות ביחד!)
 // ==========================================
 app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (body.typeWebhook !== 'incomingMessageReceived') return res.sendStatus(200);
 
+    // מאיזה לקוח שלנו הגיעה ההודעה?
+    const currentInstanceId = body.idInstance; 
     const chatId = body.senderData?.chatId;
     let text = (body.messageData?.textMessageData?.textMessage || body.messageData?.extendedTextMessageData?.text || "").trim();
     
-    if (!chatId || !text) return res.sendStatus(200);
+    if (!currentInstanceId || !chatId || !text) return res.sendStatus(200);
 
-    // מושכים את הלקוח מהמסד כדי לבדוק באיזה שלב הוא
-    let chat = await ChatState.findOne({ chatId });
-    if (!chat) {
-        chat = new ChatState({ chatId, state: 'IDLE' });
+    // שולפים את נתוני הגוגל של הלקוח *הספציפי* הזה ממסד הנתונים
+    const clientData = await ClientAuth.findOne({ instanceId: currentInstanceId });
+    if (!clientData || !clientData.googleTokens) {
+        console.log(`⚠️ הודעה התקבלה עבור לקוח ${currentInstanceId} אבל הוא עדיין לא מחובר לגוגל.`);
+        return res.sendStatus(200);
     }
 
-    // שלב 1: זיהוי ההודעה הראשונית
+    // שולפים את מצב השיחה (מול הלקוח הספציפי)
+    let chat = await ChatState.findOne({ instanceId: currentInstanceId, chatId: chatId });
+    if (!chat) chat = new ChatState({ instanceId: currentInstanceId, chatId: chatId, state: 'IDLE' });
+
+    // --- הזרימה ---
+
+    // שלב 1: זיהוי ההודעה
     if (text === "שלום אשמח לצפות בסטטוס שלך" || text === "אשמח לצפות בסטטוס") {
-        await sendWAMessage(chatId, "מה השם?");
+        await sendWAMessage(currentInstanceId, clientData.apiToken, chatId, "מה השם?");
         chat.state = 'WAITING_FOR_NAME';
         await chat.save();
         return res.sendStatus(200);
     }
 
-    // שלב 2: קבלת השם ושמירה בגוגל
+    // שלב 2: קבלת השם ושמירה בגוגל של הלקוח!
     if (chat.state === 'WAITING_FOR_NAME') {
-        const clientName = text;
+        const contactName = text;
         const phoneNumber = "+" + chatId.replace('@c.us', ''); 
 
         try {
-            await loadGoogleAuth();
-            if (oauth2Client.credentials && oauth2Client.credentials.access_token) {
-                const people = google.people({ version: 'v1', auth: oauth2Client });
-                await people.people.createContact({
-                    requestBody: {
-                        names: [{ givenName: clientName }],
-                        phoneNumbers: [{ value: phoneNumber }]
-                    }
-                });
-                console.log(`✅ איש קשר נשמר בגוגל: ${clientName} (${phoneNumber})`);
-            }
+            const oauth2Client = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
+            // מגדירים את הגישה הספציפית של הלקוח הזה
+            oauth2Client.setCredentials(clientData.googleTokens);
+
+            const people = google.people({ version: 'v1', auth: oauth2Client });
+            await people.people.createContact({
+                requestBody: {
+                    names: [{ givenName: contactName }],
+                    phoneNumbers: [{ value: phoneNumber }]
+                }
+            });
+            console.log(`👤 איש קשר נשמר בהצלחה בגוגל של לקוח: ${currentInstanceId}`);
         } catch (err) {
-            console.error('❌ שגיאה ביצירת איש קשר בגוגל:', err.message);
+            console.error('❌ שגיאה ביצירת איש קשר:', err.message);
         }
 
-        await sendWAMessage(chatId, "נשמרת");
+        await sendWAMessage(currentInstanceId, clientData.apiToken, chatId, "נשמרת");
         
-        // מעדכנים סטטוס כדי שהבוט לא ישאל שוב
         chat.state = 'COMPLETED';
         await chat.save();
         return res.sendStatus(200);
@@ -130,4 +150,4 @@ app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
 });
 
-app.listen(PORT, () => console.log(`🚀 WA Status Bot is running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 TPG Multi-Tenant Bot running on port ${PORT}`));
